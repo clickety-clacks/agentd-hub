@@ -40,22 +40,41 @@ async fn run() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await
         .map_err(|error| format!("listen_failed: {error}"))?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| format!("signal_handler_failed: {error}"))?;
     let app = web::router(hub.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-    });
-    tokio::task::yield_now().await;
-    let watchers = spawn_watchers(hub, programs, deadlines);
-    let result = server
-        .await
-        .map_err(|error| format!("server_task_failed: {error}"))?
-        .map_err(|error| format!("server_failed: {error}"));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let watchers = spawn_watchers(hub, programs, deadlines, shutdown_rx);
+    let result = {
+        let server = async move {
+            axum::serve(listener, app)
+                .await
+                .map_err(|error| format!("server_failed: {error}"))
+        };
+        tokio::pin!(server);
+        #[cfg(unix)]
+        let result = tokio::select! {
+            result = &mut server => result,
+            _ = tokio::signal::ctrl_c() => Ok(()),
+            _ = terminate.recv() => Ok(()),
+        };
+        #[cfg(not(unix))]
+        let result = tokio::select! {
+            result = &mut server => result,
+            _ = tokio::signal::ctrl_c() => Ok(()),
+        };
+        result
+    };
+    shutdown_tx.send_replace(true);
+    let mut watcher_error = None;
     for watcher in watchers {
-        watcher.abort();
+        if let Err(error) = watcher.await {
+            watcher_error.get_or_insert_with(|| format!("watcher_task_failed: {error}"));
+        }
+    }
+    if let Some(error) = watcher_error {
+        return Err(error);
     }
     result
 }

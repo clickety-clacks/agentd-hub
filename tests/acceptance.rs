@@ -63,10 +63,22 @@ impl RunningHub {
         Self { child, address }
     }
 
-    fn stop(mut self) {
-        let result = unsafe { libc::kill(self.child.id() as i32, libc::SIGINT) };
+    fn stop_with_sigterm(mut self) {
+        let result = unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         assert_eq!(result, 0);
-        assert!(self.child.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("hub did not exit after SIGTERM before deadline");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -101,17 +113,48 @@ case " $* " in
     echo "$machine" >> {probe_log}
     printf '{{"type":"snapshot","schema":"agentd.snapshot.v1","instanceId":"instance-%s","revision":3,"observedAtUnixMs":4,"scan":{{"state":"complete","issues":[]}},"agents":[{{"id":{{"pid":7,"startTimeTicks":9}},"harness":"codex","detectedBy":"proc_comm","presence":{{"state":"present","cause":null}},"cwd":{{"state":"known","value":"/work/<script>","cause":null}},"activity":{{"state":"needs_attention","source":"hook","observedAtUnixMs":1}},"tty":"pts/1","tmux":{{"session":"agents","windowIndex":2,"windowName":"<img>","paneId":"%%7"}},"name":"<script>external.example","startedAtUnixMs":1}}]}}\n' "$machine"
     ;;
-  *" agentd watch --json "*) exec sleep 30 ;;
+  *" agentd watch --json "*) echo $$ >> {watch_pid_log}; exec sleep 30 ;;
   *) exit 255 ;;
 esac
 "##,
             stderr_sentinel = STDERR_SENTINEL,
-            probe_log = root.path().join("probe-calls").display()
+            probe_log = root.path().join("probe-calls").display(),
+            watch_pid_log = root.path().join("watch-pids").display()
         ),
     );
     fs::write(root.path().join("tailscale-calls"), "").unwrap();
     fs::write(root.path().join("probe-calls"), "").unwrap();
+    fs::write(root.path().join("watch-pids"), "").unwrap();
     root
+}
+
+fn wait_for_watch_pids(root: &Path, expected: usize) -> Vec<i32> {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let pids: Vec<_> = fs::read_to_string(root.join("watch-pids"))
+            .unwrap()
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        if pids.len() >= expected {
+            return pids;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} watch children, observed {pids:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_processes_gone(pids: &[i32]) {
+    for pid in pids {
+        assert_eq!(
+            unsafe { libc::kill(*pid, 0) },
+            -1,
+            "watch child {pid} remained alive after hub exit"
+        );
+    }
 }
 
 fn request(address: &str, path: &str, extra_headers: &str, stream: bool) -> String {
@@ -148,6 +191,29 @@ fn request(address: &str, path: &str, extra_headers: &str, stream: bool) -> Stri
         }
     }
     String::from_utf8(bytes).unwrap()
+}
+
+fn subscribe(address: &str) -> TcpStream {
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = socket.read(&mut buffer).unwrap();
+        assert_ne!(count, 0, "SSE connection closed before the first event");
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes
+            .windows(b"event: snapshot".len())
+            .any(|window| window == b"event: snapshot")
+        {
+            return socket;
+        }
+    }
 }
 
 fn top_level_names(path: &Path) -> Vec<PathBuf> {
@@ -217,12 +283,18 @@ fn loopback_snapshot_sse_privacy_routes_and_stateless_restart() {
     assert!(post.starts_with("HTTP/1.1 405 Method Not Allowed"));
     assert!(request(&hub.address, "/snapshot", "", false).contains("\"revision\":1"));
 
-    hub.stop();
+    let subscriber = subscribe(&hub.address);
+    let first_watchers = wait_for_watch_pids(fixture.path(), 2);
+    hub.stop_with_sigterm();
+    assert_processes_gone(&first_watchers);
+    drop(subscriber);
     assert_eq!(top_level_names(fixture.path()), before);
 
     let restarted = RunningHub::start(fixture.path());
     assert!(request(&restarted.address, "/snapshot", "", false).contains("\"revision\":1"));
-    restarted.stop();
+    let all_watchers = wait_for_watch_pids(fixture.path(), 4);
+    restarted.stop_with_sigterm();
+    assert_processes_gone(&all_watchers);
     assert_eq!(top_level_names(fixture.path()), before);
 }
 

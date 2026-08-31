@@ -5,11 +5,13 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 pub fn spawn_watchers(
     hub: HubState,
     programs: Programs,
     deadlines: Deadlines,
+    shutdown: watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     hub.current()
         .sources
@@ -18,17 +20,31 @@ pub fn spawn_watchers(
             let machine = source.machine.clone();
             let hub = hub.clone();
             let programs = programs.clone();
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                watch_source(hub, programs, deadlines, machine).await;
+                watch_source(hub, programs, deadlines, machine, shutdown).await;
             })
         })
         .collect()
 }
 
-async fn watch_source(hub: HubState, programs: Programs, deadlines: Deadlines, machine: String) {
+async fn watch_source(
+    hub: HubState,
+    programs: Programs,
+    deadlines: Deadlines,
+    machine: String,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut backoff = Backoff::default();
     loop {
-        let attempt = watch_attempt(&hub, &programs, deadlines, &machine).await;
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(attempt) =
+            watch_attempt(&hub, &programs, deadlines, &machine, &mut shutdown).await
+        else {
+            return;
+        };
         if attempt.accepted_frame {
             backoff.reset();
         }
@@ -36,7 +52,11 @@ async fn watch_source(hub: HubState, programs: Programs, deadlines: Deadlines, m
             WatchOutcome::NoAgentd => hub.mark_no_agentd(&machine, unix_time_ms()),
             WatchOutcome::Failed => hub.mark_not_reached(&machine, unix_time_ms()),
         }
-        tokio::time::sleep(backoff.next_delay()).await;
+        tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut shutdown) => return,
+            _ = tokio::time::sleep(backoff.next_delay()) => {}
+        }
     }
 }
 
@@ -55,14 +75,15 @@ async fn watch_attempt(
     programs: &Programs,
     deadlines: Deadlines,
     machine: &str,
-) -> AttemptResult {
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<AttemptResult> {
     let mut child = match spawn_watch(&programs.ssh, machine) {
         Ok(child) => child,
         Err(_) => {
-            return AttemptResult {
+            return Some(AttemptResult {
                 accepted_frame: false,
                 outcome: WatchOutcome::Failed,
-            };
+            });
         }
     };
     let stdout = child.stdout.take().expect("watch stdout is piped");
@@ -73,16 +94,31 @@ async fn watch_attempt(
 
     loop {
         let next_line = if accepted_frame {
-            lines.next_line().await
+            tokio::select! {
+                biased;
+                _ = shutdown_requested(shutdown) => {
+                    terminate_and_reap(&mut child).await;
+                    return None;
+                }
+                line = lines.next_line() => line,
+            }
         } else {
-            match tokio::time::timeout_at(first_frame.deadline(), lines.next_line()).await {
+            let line = tokio::select! {
+                biased;
+                _ = shutdown_requested(shutdown) => {
+                    terminate_and_reap(&mut child).await;
+                    return None;
+                }
+                line = tokio::time::timeout_at(first_frame.deadline(), lines.next_line()) => line,
+            };
+            match line {
                 Ok(line) => line,
                 Err(_) => {
                     terminate_and_reap(&mut child).await;
-                    return AttemptResult {
+                    return Some(AttemptResult {
                         accepted_frame,
                         outcome: WatchOutcome::Failed,
-                    };
+                    });
                 }
             }
         };
@@ -94,18 +130,18 @@ async fn watch_attempt(
                 }
                 Err(_) => {
                     terminate_and_reap(&mut child).await;
-                    return AttemptResult {
+                    return Some(AttemptResult {
                         accepted_frame,
                         outcome: WatchOutcome::Failed,
-                    };
+                    });
                 }
             },
             Err(_) => {
                 terminate_and_reap(&mut child).await;
-                return AttemptResult {
+                return Some(AttemptResult {
                     accepted_frame,
                     outcome: WatchOutcome::Failed,
-                };
+                });
             }
             Ok(None) => {
                 let status = child.wait().await.ok();
@@ -118,13 +154,20 @@ async fn watch_attempt(
                 } else {
                     WatchOutcome::Failed
                 };
-                return AttemptResult {
+                return Some(AttemptResult {
                     accepted_frame,
                     outcome,
-                };
+                });
             }
         }
     }
+}
+
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    let _ = shutdown.changed().await;
 }
 
 fn spawn_watch(ssh: &std::path::Path, machine: &str) -> std::io::Result<Child> {
@@ -228,6 +271,7 @@ mod tests {
             }],
             1,
         );
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let result = watch_attempt(
             &hub,
             &Programs {
@@ -240,8 +284,10 @@ mod tests {
                 watch_first_frame: Duration::from_millis(50),
             },
             "a",
+            &mut shutdown_rx,
         )
         .await;
+        let result = result.expect("watch attempt should finish before shutdown");
         assert!(!result.accepted_frame);
         assert!(matches!(result.outcome, WatchOutcome::Failed));
         let pid: i32 = std::fs::read_to_string(pid_file)
@@ -268,6 +314,7 @@ mod tests {
             }],
             1,
         );
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let result = watch_attempt(
             &hub,
             &Programs {
@@ -276,8 +323,10 @@ mod tests {
             },
             Deadlines::default(),
             "a",
+            &mut shutdown_rx,
         )
         .await;
+        let result = result.expect("watch attempt should finish before shutdown");
         assert!(result.accepted_frame);
         assert!(matches!(result.outcome, WatchOutcome::Failed));
         assert_eq!(hub.current().revision, 2);
