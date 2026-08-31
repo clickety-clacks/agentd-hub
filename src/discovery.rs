@@ -1,3 +1,4 @@
+use crate::lifecycle::shutdown_requested;
 use crate::model::{Health, parse_agentd_snapshot};
 use crate::state::SourceSeed;
 use serde_json::Value;
@@ -7,6 +8,7 @@ use std::process::ExitStatus;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
 pub struct Programs {
@@ -43,6 +45,7 @@ impl Default for Deadlines {
 #[derive(Debug)]
 pub enum DiscoveryError {
     NoTargets,
+    Shutdown,
     HostsFile {
         path: PathBuf,
         source: std::io::Error,
@@ -52,6 +55,7 @@ pub enum DiscoveryError {
 impl fmt::Display for DiscoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Shutdown => write!(formatter, "discovery_cancelled"),
             Self::NoTargets => write!(
                 formatter,
                 "discovery_no_targets: Tailscale yielded no machine and no hosts-file target was available"
@@ -71,15 +75,18 @@ pub async fn discover(
     programs: &Programs,
     deadlines: Deadlines,
     hosts_file: Option<&Path>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<Vec<SourceSeed>, DiscoveryError> {
     let tailscale = run_command(
         &programs.tailscale,
         &["status".into(), "--json".into()],
         deadlines.tailscale,
+        &mut shutdown,
     )
     .await;
     let targets = match tailscale {
-        Ok(output) if output.status.success() && !output.timed_out => {
+        Ok(CommandOutcome::Shutdown) => return Err(DiscoveryError::Shutdown),
+        Ok(CommandOutcome::Completed(output)) if output.status.success() && !output.timed_out => {
             tailscale_targets(&output.stdout).unwrap_or_default()
         }
         _ => Vec::new(),
@@ -107,7 +114,7 @@ pub async fn discover(
 
     let mut seeds = Vec::with_capacity(targets.len());
     for machine in targets {
-        seeds.push(probe_source(programs, deadlines.probe, machine).await);
+        seeds.push(probe_source(programs, deadlines.probe, machine, &mut shutdown).await?);
     }
     Ok(seeds)
 }
@@ -156,7 +163,12 @@ pub fn hosts_targets(bytes: &[u8]) -> Vec<String> {
     targets
 }
 
-async fn probe_source(programs: &Programs, deadline: Duration, machine: String) -> SourceSeed {
+async fn probe_source(
+    programs: &Programs,
+    deadline: Duration,
+    machine: String,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<SourceSeed, DiscoveryError> {
     let args = vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -167,10 +179,11 @@ async fn probe_source(programs: &Programs, deadline: Duration, machine: String) 
         "list".into(),
         "--json".into(),
     ];
-    let result = run_command(&programs.ssh, &args, deadline).await;
+    let result = run_command(&programs.ssh, &args, deadline, shutdown).await;
     let now = unix_time_ms();
-    match result {
-        Ok(output) if !output.timed_out => {
+    let seed = match result {
+        Ok(CommandOutcome::Shutdown) => return Err(DiscoveryError::Shutdown),
+        Ok(CommandOutcome::Completed(output)) if !output.timed_out => {
             if let Ok(snapshot) = parse_single_frame(&output.stdout) {
                 SourceSeed {
                     machine,
@@ -200,7 +213,8 @@ async fn probe_source(programs: &Programs, deadline: Duration, machine: String) 
             health: Health::NotReached { since_unix_ms: now },
             snapshot: None,
         },
-    }
+    };
+    Ok(seed)
 }
 
 pub fn parse_single_frame(bytes: &[u8]) -> Result<crate::model::AgentdSnapshot, String> {
@@ -233,11 +247,20 @@ pub struct CommandOutput {
     pub timed_out: bool,
 }
 
+pub enum CommandOutcome {
+    Completed(CommandOutput),
+    Shutdown,
+}
+
 pub async fn run_command(
     program: &Path,
     args: &[String],
     deadline: Duration,
-) -> std::io::Result<CommandOutput> {
+    shutdown: &mut watch::Receiver<bool>,
+) -> std::io::Result<CommandOutcome> {
+    if *shutdown.borrow() {
+        return Ok(CommandOutcome::Shutdown);
+    }
     let mut child = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -250,7 +273,20 @@ pub async fn run_command(
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).await.map(|_| bytes)
     });
-    let (status, timed_out) = match tokio::time::timeout(deadline, child.wait()).await {
+    let wait_result = tokio::select! {
+        biased;
+        _ = shutdown_requested(shutdown) => None,
+        result = tokio::time::timeout(deadline, child.wait()) => Some(result),
+    };
+    let Some(wait_result) = wait_result else {
+        if child.try_wait()?.is_none() {
+            child.start_kill()?;
+        }
+        let _ = child.wait().await?;
+        let _ = stdout_task.await.map_err(std::io::Error::other)??;
+        return Ok(CommandOutcome::Shutdown);
+    };
+    let (status, timed_out) = match wait_result {
         Ok(result) => (result?, false),
         Err(_) => {
             child.start_kill()?;
@@ -258,11 +294,11 @@ pub async fn run_command(
         }
     };
     let stdout = stdout_task.await.map_err(std::io::Error::other)??;
-    Ok(CommandOutput {
+    Ok(CommandOutcome::Completed(CommandOutput {
         status,
         stdout,
         timed_out,
-    })
+    }))
 }
 
 pub fn unix_time_ms() -> u64 {
@@ -314,9 +350,13 @@ mod tests {
                 pid_file.display()
             ),
         );
-        let output = run_command(&script, &[], Duration::from_millis(50))
+        let (_shutdown_tx, mut shutdown_rx) = crate::lifecycle::shutdown_channel();
+        let outcome = run_command(&script, &[], Duration::from_millis(50), &mut shutdown_rx)
             .await
             .unwrap();
+        let CommandOutcome::Completed(output) = outcome else {
+            panic!("command shut down before its deadline")
+        };
         assert!(output.timed_out);
         let pid: i32 = std::fs::read_to_string(pid_file)
             .unwrap()
@@ -348,6 +388,7 @@ esac
 "##,
         );
         let programs = Programs { tailscale, ssh };
+        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::shutdown_channel();
         let seeds = discover(
             &programs,
             Deadlines {
@@ -356,6 +397,7 @@ esac
                 watch_first_frame: Duration::from_secs(1),
             },
             None,
+            shutdown_rx,
         )
         .await
         .unwrap();
@@ -399,6 +441,7 @@ esac
         );
         std::fs::write(&hosts, "b\n# ignored\na\na\n").unwrap();
         let programs = Programs { tailscale, ssh };
+        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::shutdown_channel();
         let seeds = discover(
             &programs,
             Deadlines {
@@ -407,6 +450,7 @@ esac
                 watch_first_frame: Duration::from_secs(1),
             },
             Some(&hosts),
+            shutdown_rx,
         )
         .await
         .unwrap();

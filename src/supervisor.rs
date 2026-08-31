@@ -1,4 +1,5 @@
 use crate::discovery::{Deadlines, Programs, unix_time_ms};
+use crate::lifecycle::shutdown_requested;
 use crate::model::parse_agentd_snapshot;
 use crate::state::HubState;
 use std::process::Stdio;
@@ -161,13 +162,6 @@ async fn watch_attempt(
             }
         }
     }
-}
-
-async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    let _ = shutdown.changed().await;
 }
 
 fn spawn_watch(ssh: &std::path::Path, machine: &str) -> std::io::Result<Child> {

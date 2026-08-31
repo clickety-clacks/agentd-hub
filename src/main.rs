@@ -1,4 +1,5 @@
-use agentd_hub::discovery::{Deadlines, Programs, discover, unix_time_ms};
+use agentd_hub::discovery::{Deadlines, DiscoveryError, Programs, discover, unix_time_ms};
+use agentd_hub::lifecycle::{shutdown_channel, shutdown_requested};
 use agentd_hub::state::HubState;
 use agentd_hub::supervisor::spawn_watchers;
 use agentd_hub::web;
@@ -31,21 +32,29 @@ async fn run() -> Result<(), String> {
         ));
     }
 
+    let (shutdown_tx, shutdown_rx) = shutdown_channel();
+    let _signal_task = spawn_signal_listener(shutdown_tx.clone())?;
     let programs = Programs::default();
     let deadlines = Deadlines::default();
-    let seeds = discover(&programs, deadlines, options.hosts_file.as_deref())
-        .await
-        .map_err(|error| error.to_string())?;
+    let seeds = match discover(
+        &programs,
+        deadlines,
+        options.hosts_file.as_deref(),
+        shutdown_rx.clone(),
+    )
+    .await
+    {
+        Ok(seeds) => seeds,
+        Err(DiscoveryError::Shutdown) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
     let hub = HubState::new(seeds, unix_time_ms());
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await
         .map_err(|error| format!("listen_failed: {error}"))?;
-    #[cfg(unix)]
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|error| format!("signal_handler_failed: {error}"))?;
     let app = web::router(hub.clone());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let watchers = spawn_watchers(hub, programs, deadlines, shutdown_rx);
+    let watchers = spawn_watchers(hub, programs, deadlines, shutdown_rx.clone());
+    let mut server_shutdown = shutdown_rx;
     let result = {
         let server = async move {
             axum::serve(listener, app)
@@ -53,16 +62,9 @@ async fn run() -> Result<(), String> {
                 .map_err(|error| format!("server_failed: {error}"))
         };
         tokio::pin!(server);
-        #[cfg(unix)]
         let result = tokio::select! {
             result = &mut server => result,
-            _ = tokio::signal::ctrl_c() => Ok(()),
-            _ = terminate.recv() => Ok(()),
-        };
-        #[cfg(not(unix))]
-        let result = tokio::select! {
-            result = &mut server => result,
-            _ = tokio::signal::ctrl_c() => Ok(()),
+            _ = shutdown_requested(&mut server_shutdown) => Ok(()),
         };
         result
     };
@@ -77,6 +79,34 @@ async fn run() -> Result<(), String> {
         return Err(error);
     }
     result
+}
+
+fn spawn_signal_listener(
+    shutdown: tokio::sync::watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    #[cfg(unix)]
+    {
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|error| format!("signal_handler_failed: {error}"))?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| format!("signal_handler_failed: {error}"))?;
+        Ok(tokio::spawn(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            shutdown.send_replace(true);
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.send_replace(true);
+        }))
+    }
 }
 
 fn parse_options() -> Result<Option<Options>, String> {

@@ -17,28 +17,7 @@ struct RunningHub {
 
 impl RunningHub {
     fn start(root: &Path) -> Self {
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reservation.local_addr().unwrap().to_string();
-        drop(reservation);
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![root.join("bin")];
-        paths.extend(std::env::split_paths(&path));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agentd-hub"))
-            .args([
-                "--listen",
-                &address,
-                "--hosts-file",
-                root.join("must-not-read-hosts")
-                    .to_str()
-                    .expect("temporary path is UTF-8"),
-            ])
-            .current_dir(root)
-            .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("PRIVATE_TEST_VALUE", PRIVATE_SENTINEL)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let (mut child, address) = spawn_hub(root);
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             if TcpStream::connect(&address).is_ok() {
@@ -54,31 +33,61 @@ impl RunningHub {
                     .unwrap();
                 panic!("hub exited before listening: {status}: {stderr}");
             }
-            assert!(
-                Instant::now() < deadline,
-                "hub did not listen before deadline"
-            );
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("hub did not listen before deadline");
+            }
             thread::sleep(Duration::from_millis(20));
         }
         Self { child, address }
     }
 
     fn stop_with_sigterm(mut self) {
-        let result = unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        assert_eq!(result, 0);
-        let deadline = Instant::now() + Duration::from_secs(4);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success());
-                return;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!("hub did not exit after SIGTERM before deadline");
-            }
-            thread::sleep(Duration::from_millis(20));
+        assert!(stop_child_with_sigterm(&mut self.child).success());
+    }
+}
+
+fn spawn_hub(root: &Path) -> (Child, String) {
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap().to_string();
+    drop(reservation);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![root.join("bin")];
+    paths.extend(std::env::split_paths(&path));
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd-hub"))
+        .args([
+            "--listen",
+            &address,
+            "--hosts-file",
+            root.join("must-not-read-hosts")
+                .to_str()
+                .expect("temporary path is UTF-8"),
+        ])
+        .current_dir(root)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("PRIVATE_TEST_VALUE", PRIVATE_SENTINEL)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (child, address)
+}
+
+fn stop_child_with_sigterm(child: &mut Child) -> std::process::ExitStatus {
+    let result = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(result, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
         }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("hub did not exit after SIGTERM before deadline");
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -149,11 +158,28 @@ fn wait_for_watch_pids(root: &Path, expected: usize) -> Vec<i32> {
 
 fn assert_processes_gone(pids: &[i32]) {
     for pid in pids {
-        assert_eq!(
-            unsafe { libc::kill(*pid, 0) },
-            -1,
-            "watch child {pid} remained alive after hub exit"
-        );
+        if unsafe { libc::kill(*pid, 0) } == 0 {
+            let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+            panic!("owned child {pid} remained alive after hub exit");
+        }
+    }
+}
+
+fn wait_for_pid_file(hub: &mut Child, path: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Ok(pid) = fs::read_to_string(path) {
+            return pid.trim().parse().unwrap();
+        }
+        if let Some(status) = hub.try_wait().unwrap() {
+            panic!("hub exited before child PID was recorded: {status}");
+        }
+        if Instant::now() >= deadline {
+            let _ = hub.kill();
+            let _ = hub.wait();
+            panic!("child PID was not recorded before deadline");
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -296,6 +322,53 @@ fn loopback_snapshot_sse_privacy_routes_and_stateless_restart() {
     restarted.stop_with_sigterm();
     assert_processes_gone(&all_watchers);
     assert_eq!(top_level_names(fixture.path()), before);
+}
+
+#[test]
+fn sigterm_during_tailscale_discovery_reaps_the_child() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let pid_file = root.path().join("tailscale-pid");
+    executable(
+        &bin.join("tailscale"),
+        &format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    executable(&bin.join("ssh"), "#!/bin/sh\nexit 255\n");
+
+    let (mut hub, _) = spawn_hub(root.path());
+    let pid = wait_for_pid_file(&mut hub, &pid_file);
+    let status = stop_child_with_sigterm(&mut hub);
+    assert_processes_gone(&[pid]);
+    assert!(status.success());
+}
+
+#[test]
+fn sigterm_during_ssh_probe_reaps_the_child() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let pid_file = root.path().join("ssh-pid");
+    executable(
+        &bin.join("tailscale"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"Self\":{\"DNSName\":\"alpha.\"},\"Peer\":{}}'\n",
+    );
+    executable(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+
+    let (mut hub, _) = spawn_hub(root.path());
+    let pid = wait_for_pid_file(&mut hub, &pid_file);
+    let status = stop_child_with_sigterm(&mut hub);
+    assert_processes_gone(&[pid]);
+    assert!(status.success());
 }
 
 #[test]
