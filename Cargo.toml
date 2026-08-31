@@ -1,0 +1,24 @@
+[package]
+name = "agentd-hub"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "Local multi-machine aggregator for Agentd snapshots"
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+libc = "0.2"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
