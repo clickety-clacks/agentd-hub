@@ -4,7 +4,7 @@ use crate::model::parse_agentd_snapshot;
 use crate::state::HubState;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
@@ -78,7 +78,7 @@ async fn watch_attempt(
     machine: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Option<AttemptResult> {
-    let mut child = match spawn_watch(&programs.ssh, machine) {
+    let child = match spawn_watch(&programs.ssh, machine) {
         Ok(child) => child,
         Err(_) => {
             return Some(AttemptResult {
@@ -87,80 +87,145 @@ async fn watch_attempt(
             });
         }
     };
+    watch_child(hub, child, deadlines, machine, shutdown).await
+}
+
+async fn watch_child(
+    hub: &HubState,
+    mut child: Child,
+    deadlines: Deadlines,
+    machine: &str,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<AttemptResult> {
     let stdout = child.stdout.take().expect("watch stdout is piped");
     let mut lines = BufReader::new(stdout).lines();
-    let first_frame = tokio::time::sleep(deadlines.watch_first_frame);
-    tokio::pin!(first_frame);
+    let first_frame_deadline = tokio::time::Instant::now() + deadlines.watch_first_frame;
     let mut accepted_frame = false;
 
     loop {
-        let next_line = if accepted_frame {
+        let event = if accepted_frame {
             tokio::select! {
                 biased;
-                _ = shutdown_requested(shutdown) => {
-                    terminate_and_reap(&mut child).await;
-                    return None;
-                }
-                line = lines.next_line() => line,
+                _ = shutdown_requested(shutdown) => WatchEvent::Shutdown,
+                status = child.wait() => WatchEvent::Exited(status),
+                line = lines.next_line() => WatchEvent::Line(line),
             }
         } else {
-            let line = tokio::select! {
+            tokio::select! {
                 biased;
-                _ = shutdown_requested(shutdown) => {
-                    terminate_and_reap(&mut child).await;
-                    return None;
-                }
-                line = tokio::time::timeout_at(first_frame.deadline(), lines.next_line()) => line,
-            };
-            match line {
-                Ok(line) => line,
-                Err(_) => {
-                    terminate_and_reap(&mut child).await;
-                    return Some(AttemptResult {
-                        accepted_frame,
-                        outcome: WatchOutcome::Failed,
-                    });
-                }
+                _ = shutdown_requested(shutdown) => WatchEvent::Shutdown,
+                status = child.wait() => WatchEvent::Exited(status),
+                line = lines.next_line() => WatchEvent::Line(line),
+                _ = tokio::time::sleep_until(first_frame_deadline) => WatchEvent::FirstFrameDeadline,
             }
         };
-        match next_line {
-            Ok(Some(line)) => match parse_agentd_snapshot(line.as_bytes()) {
-                Ok(snapshot) => {
-                    accepted_frame = true;
-                    hub.accept_snapshot(machine, snapshot, unix_time_ms());
-                }
-                Err(_) => {
-                    terminate_and_reap(&mut child).await;
+
+        match event {
+            WatchEvent::Shutdown => {
+                terminate_and_reap(&mut child).await;
+                return None;
+            }
+            WatchEvent::Exited(Ok(status)) => {
+                if drain_frames(hub, machine, &mut lines, &mut accepted_frame)
+                    .await
+                    .is_err()
+                {
                     return Some(AttemptResult {
                         accepted_frame,
                         outcome: WatchOutcome::Failed,
                     });
                 }
-            },
-            Err(_) => {
+                return Some(AttemptResult {
+                    accepted_frame,
+                    outcome: completed_outcome(accepted_frame, Some(status)),
+                });
+            }
+            WatchEvent::Exited(Err(_)) => {
                 terminate_and_reap(&mut child).await;
                 return Some(AttemptResult {
                     accepted_frame,
                     outcome: WatchOutcome::Failed,
                 });
             }
-            Ok(None) => {
-                let status = child.wait().await.ok();
-                let outcome = if !accepted_frame
-                    && matches!(
-                        status.and_then(|status| status.code()),
-                        Some(126) | Some(127)
-                    ) {
-                    WatchOutcome::NoAgentd
-                } else {
-                    WatchOutcome::Failed
-                };
+            WatchEvent::Line(Ok(Some(line))) => {
+                if accept_frame(hub, machine, &line, &mut accepted_frame).is_err() {
+                    terminate_and_reap(&mut child).await;
+                    return Some(AttemptResult {
+                        accepted_frame,
+                        outcome: WatchOutcome::Failed,
+                    });
+                }
+            }
+            WatchEvent::Line(Err(_)) => {
+                terminate_and_reap(&mut child).await;
                 return Some(AttemptResult {
                     accepted_frame,
-                    outcome,
+                    outcome: WatchOutcome::Failed,
+                });
+            }
+            WatchEvent::Line(Ok(None)) => {
+                let status = child.wait().await.ok();
+                return Some(AttemptResult {
+                    accepted_frame,
+                    outcome: completed_outcome(accepted_frame, status),
+                });
+            }
+            WatchEvent::FirstFrameDeadline => {
+                terminate_and_reap(&mut child).await;
+                let _ = drain_frames(hub, machine, &mut lines, &mut accepted_frame).await;
+                return Some(AttemptResult {
+                    accepted_frame,
+                    outcome: WatchOutcome::Failed,
                 });
             }
         }
+    }
+}
+
+enum WatchEvent {
+    Shutdown,
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Line(std::io::Result<Option<String>>),
+    FirstFrameDeadline,
+}
+
+fn accept_frame(
+    hub: &HubState,
+    machine: &str,
+    line: &str,
+    accepted_frame: &mut bool,
+) -> Result<(), ()> {
+    let snapshot = parse_agentd_snapshot(line.as_bytes()).map_err(|_| ())?;
+    *accepted_frame = true;
+    hub.accept_snapshot(machine, snapshot, unix_time_ms());
+    Ok(())
+}
+
+async fn drain_frames<R: AsyncBufRead + Unpin>(
+    hub: &HubState,
+    machine: &str,
+    lines: &mut Lines<R>,
+    accepted_frame: &mut bool,
+) -> Result<(), ()> {
+    while let Some(line) = lines.next_line().await.map_err(|_| ())? {
+        accept_frame(hub, machine, &line, accepted_frame)?;
+    }
+    Ok(())
+}
+
+fn completed_outcome(
+    accepted_frame: bool,
+    status: Option<std::process::ExitStatus>,
+) -> WatchOutcome {
+    if !accepted_frame
+        && matches!(
+            status.and_then(|status| status.code()),
+            Some(126) | Some(127)
+        )
+    {
+        WatchOutcome::NoAgentd
+    } else {
+        WatchOutcome::Failed
     }
 }
 
@@ -223,15 +288,18 @@ mod tests {
     use super::*;
     use crate::model::Health;
     use crate::state::SourceSeed;
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
-    fn executable(path: &std::path::Path, contents: &str) {
-        let mut file = std::fs::File::create(path).unwrap();
-        file.write_all(contents.as_bytes()).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn fake_ssh() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ssh.sh")
+    }
+
+    fn wait_for_file(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "fake SSH did not report startup");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -248,36 +316,29 @@ mod tests {
     #[tokio::test]
     async fn first_frame_deadline_terminates_and_reaps_the_watch_child() {
         let directory = tempfile::tempdir().unwrap();
-        let ssh = directory.path().join("ssh");
+        let machine = directory.path().display().to_string();
         let pid_file = directory.path().join("pid");
-        executable(
-            &ssh,
-            &format!(
-                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
-                pid_file.display()
-            ),
-        );
+        std::fs::write(directory.path().join("mode"), "timeout\n").unwrap();
         let hub = HubState::new(
             vec![SourceSeed {
-                machine: "a".into(),
+                machine: machine.clone(),
                 health: Health::NotReached { since_unix_ms: 1 },
                 snapshot: None,
             }],
             1,
         );
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let result = watch_attempt(
+        let child = spawn_watch(&fake_ssh(), &machine).unwrap();
+        wait_for_file(&pid_file);
+        let result = watch_child(
             &hub,
-            &Programs {
-                tailscale: "unused".into(),
-                ssh,
-            },
+            child,
             Deadlines {
                 tailscale: Duration::from_secs(1),
                 probe: Duration::from_secs(1),
                 watch_first_frame: Duration::from_millis(50),
             },
-            "a",
+            &machine,
             &mut shutdown_rx,
         )
         .await;
@@ -295,28 +356,27 @@ mod tests {
     #[tokio::test]
     async fn one_valid_frame_publishes_once_before_exit() {
         let directory = tempfile::tempdir().unwrap();
-        let ssh = directory.path().join("ssh");
-        executable(
-            &ssh,
-            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"snapshot\",\"schema\":\"agentd.snapshot.v1\",\"instanceId\":\"i\",\"revision\":1,\"observedAtUnixMs\":1,\"scan\":{},\"agents\":[]}'\n",
-        );
+        let machine = directory.path().display().to_string();
+        let started_file = directory.path().join("started");
+        let exited_file = directory.path().join("exited");
+        std::fs::write(directory.path().join("mode"), "valid\n").unwrap();
         let hub = HubState::new(
             vec![SourceSeed {
-                machine: "a".into(),
+                machine: machine.clone(),
                 health: Health::NotReached { since_unix_ms: 1 },
                 snapshot: None,
             }],
             1,
         );
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let result = watch_attempt(
+        let child = spawn_watch(&fake_ssh(), &machine).unwrap();
+        wait_for_file(&started_file);
+        wait_for_file(&exited_file);
+        let result = watch_child(
             &hub,
-            &Programs {
-                tailscale: "unused".into(),
-                ssh,
-            },
+            child,
             Deadlines::default(),
-            "a",
+            &machine,
             &mut shutdown_rx,
         )
         .await;
