@@ -7,9 +7,19 @@ on:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: GNU packaging tools
+        if: runner.os == 'macOS'
+        run: |
+          brew install coreutils gnu-tar
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Format
