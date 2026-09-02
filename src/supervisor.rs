@@ -1,4 +1,4 @@
-use crate::discovery::{Deadlines, Programs, unix_time_ms};
+use crate::discovery::{AgentdCommand, Deadlines, Programs, unix_time_ms};
 use crate::lifecycle::shutdown_requested;
 use crate::model::parse_agentd_snapshot;
 use crate::state::HubState;
@@ -230,6 +230,7 @@ fn completed_outcome(
 }
 
 fn spawn_watch(ssh: &std::path::Path, machine: &str) -> std::io::Result<Child> {
+    let remote_command = AgentdCommand::Watch.remote_shell();
     Command::new(ssh)
         .args([
             "-o",
@@ -241,9 +242,7 @@ fn spawn_watch(ssh: &std::path::Path, machine: &str) -> std::io::Result<Child> {
             "-o",
             "ServerAliveCountMax=1",
             machine,
-            "agentd",
-            "watch",
-            "--json",
+            remote_command,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

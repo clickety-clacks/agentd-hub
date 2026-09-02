@@ -114,16 +114,21 @@ fn fixture_root() -> tempfile::TempDir {
         &bin.join("ssh"),
         &format!(
             r##"#!/bin/sh
-case " $* " in
-  *" agentd list --json "*)
+case "$#" in
+  6)
+    [ "$6" = 'PATH="$HOME/.local/bin:$PATH" agentd list --json' ] || exit 96
     echo '{stderr_sentinel}' >&2
     machine=unknown
     for arg in "$@"; do case "$arg" in alpha|beta) machine=$arg;; esac; done
     echo "$machine" >> {probe_log}
     printf '{{"type":"snapshot","schema":"agentd.snapshot.v1","instanceId":"instance-%s","revision":3,"observedAtUnixMs":4,"scan":{{"state":"complete","issues":[]}},"agents":[{{"id":{{"pid":7,"startTimeTicks":9}},"harness":"codex","detectedBy":"proc_comm","presence":{{"state":"present","cause":null}},"cwd":{{"state":"known","value":"/work/<script>","cause":null}},"activity":{{"state":"needs_attention","source":"hook","observedAtUnixMs":1}},"tty":"pts/1","tmux":{{"session":"agents","windowIndex":2,"windowName":"<img>","paneId":"%%7"}},"name":"<script>external.example","startedAtUnixMs":1}}]}}\n' "$machine"
     ;;
-  *" agentd watch --json "*) echo $$ >> {watch_pid_log}; exec sleep 30 ;;
-  *) exit 255 ;;
+  10)
+    [ "${{10}}" = 'PATH="$HOME/.local/bin:$PATH" agentd watch --json' ] || exit 97
+    echo $$ >> {watch_pid_log}
+    exec sleep 30
+    ;;
+  *) exit 98 ;;
 esac
 "##,
             stderr_sentinel = STDERR_SENTINEL,

@@ -175,9 +175,7 @@ async fn probe_source(
         "-o".into(),
         "ConnectTimeout=10".into(),
         machine.clone(),
-        "agentd".into(),
-        "list".into(),
-        "--json".into(),
+        AgentdCommand::List.remote_shell().into(),
     ];
     let result = run_command(&programs.ssh, &args, deadline, shutdown).await;
     let now = unix_time_ms();
@@ -215,6 +213,21 @@ async fn probe_source(
         },
     };
     Ok(seed)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AgentdCommand {
+    List,
+    Watch,
+}
+
+impl AgentdCommand {
+    pub(crate) fn remote_shell(self) -> &'static str {
+        match self {
+            Self::List => r#"PATH="$HOME/.local/bin:$PATH" agentd list --json"#,
+            Self::Watch => r#"PATH="$HOME/.local/bin:$PATH" agentd watch --json"#,
+        }
+    }
 }
 
 pub fn parse_single_frame(bytes: &[u8]) -> Result<crate::model::AgentdSnapshot, String> {
@@ -336,6 +349,20 @@ mod tests {
             hosts_targets(b" z-host \n# comment\na-host\n\na-host\n"),
             vec!["a-host", "z-host"]
         );
+    }
+
+    #[test]
+    fn remote_agentd_commands_are_literal_and_closed() {
+        assert_eq!(
+            AgentdCommand::List.remote_shell(),
+            r#"PATH="$HOME/.local/bin:$PATH" agentd list --json"#
+        );
+        assert_eq!(
+            AgentdCommand::Watch.remote_shell(),
+            r#"PATH="$HOME/.local/bin:$PATH" agentd watch --json"#
+        );
+        assert!(!AgentdCommand::List.remote_shell().contains("/home/"));
+        assert!(!AgentdCommand::Watch.remote_shell().contains("/home/"));
     }
 
     #[tokio::test]

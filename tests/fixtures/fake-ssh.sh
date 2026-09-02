@@ -2,6 +2,11 @@
 set -eu
 
 machine=${9}
+[ "$#" -eq 10 ] || exit 96
+command=${10-}
+if [ "$command" != 'PATH="$HOME/.local/bin:$PATH" agentd watch --json' ]; then
+  exit 97
+fi
 mode=$(cat "$machine/mode")
 
 case "$mode" in
