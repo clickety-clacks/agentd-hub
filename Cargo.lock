@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentd-hub"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
