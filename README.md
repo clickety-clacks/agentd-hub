@@ -5,8 +5,9 @@
 Tailscale or a hosts file, runs the documented Agentd CLI through existing SSH
 access, and serves complete current snapshots on one loopback HTTP listener.
 
-The current pre-release candidate version is 0.0.0. The reviewed release flow
-will make a dedicated version change to 0.1.0 before tagging `v0.1.0`.
+The current version is 0.1.0, released as `v0.1.0`. Release archives and their
+`SHA256SUMS` receipt are built and published by CI on the release tag; see the
+[releases page](https://github.com/clickety-clacks/agentd-hub/releases).
 
 ## Build and test
 
@@ -53,5 +54,5 @@ scripts/package-release.sh
 ```
 
 The package command writes
-`target/release-assets/agentd-hub-0.0.0-<rust-host>.tar.gz` and
+`target/release-assets/agentd-hub-0.1.0-<rust-host>.tar.gz` and
 `target/release-assets/SHA256SUMS`. It does not publish a release.
