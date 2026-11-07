@@ -286,7 +286,7 @@ mod tests {
             "futureTopLevel": "ignored"
         });
         let parsed = parse_agentd_snapshot(&serde_json::to_vec(&input).unwrap()).unwrap();
-        let projected = parsed.agents[0].project("gibson", &parsed.instance_id);
+        let projected = parsed.agents[0].project("example-host", &parsed.instance_id);
         let bytes = serde_json::to_vec(&projected).unwrap();
         assert!(
             !bytes
